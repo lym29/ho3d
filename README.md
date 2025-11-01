@@ -75,6 +75,7 @@ This repository contains a collection of scripts for:
     ```
 3. Assuming ${MANO_PATH} contains the path to where you unpacked the downloaded archive, use the provided script to setup the MANO folder as required.
     ```
+    export MANO_PATH="/home/lym29/workspace/HOIrecon/assets/mano_v1_2/"
     python setup_mano.py ${MANO_PATH}
     ```
     
@@ -86,9 +87,11 @@ is the path where you unpacked the object models into (path to where _models_ fo
 6. Assuming ${DB_PATH} is the path to where you unpacked the dataset (path to where _./train/_ and _./evaluation/_ folder branch off), 
 This should enable you to run the following to show some dataset samples.
     ```
+    export YCB_PATH="/data1/DATA/YCB_models/"
+    export DB_PATH="/data1/DATA/HO3D_v3/"
     python vis_HO3D.py ${DB_PATH} ${YCB_PATH}
     python vis_HO3D.py ${DB_PATH} ${YCB_PATH} -split 'evaluation'
-    python vis_HO3D.py ${DB_PATH} ${YCB_PATH} -visType 'open3d'
+    python vis_HO3D.py ${DB_PATH} ${YCB_PATH} -visType 'matplotlib'
     
     python vis_H2O3D.py ${DB_PATH} ${YCB_PATH}
     python vis_H2O3D.py ${DB_PATH} ${YCB_PATH} -split 'evaluation'

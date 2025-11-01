@@ -7,6 +7,8 @@ import pip
 import argparse
 import base64
 import json
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 
 def install(package):
     if hasattr(pip, 'main'):
@@ -175,6 +177,65 @@ def _search_pred_file(pred_path, pred_file_name):
         raise Exception('Giving up, because its not clear which file to evaluate.')
 
 
+def _process_sample(idx, xyz_list, verts_list, pred, f_threshs):
+    """Process a single sample and return results for aggregation."""
+    xyz, verts = xyz_list[idx], verts_list[idx]
+    xyz, verts = [np.array(x) for x in [xyz, verts]]
+
+    xyz_pred, verts_pred = pred[0][idx], pred[1][idx]
+    xyz_pred, verts_pred = [np.array(x) for x in [xyz_pred, verts_pred]]
+
+    # Determine if shape is MANO
+    shape_is_mano = verts_pred.shape[0] == verts.shape[0]
+
+    # Not aligned errors - return data for feeding
+    xyz_errors = np.ones_like(xyz[:, 0])
+    xyz_data = (xyz, xyz_errors, xyz_pred)
+
+    # Scale and translation aligned predictions for xyz
+    xyz_pred_sc_tr_aligned = align_sc_tr(xyz, xyz_pred)
+    xyz_sc_tr_aligned_data = (xyz, np.ones_like(xyz[:, 0]), xyz_pred_sc_tr_aligned)
+
+    # Align predictions
+    xyz_pred_aligned = align_w_scale(xyz, xyz_pred)
+    if shape_is_mano:
+        verts_pred_aligned = align_w_scale(verts, verts_pred)
+    else:
+        trafo = align_w_scale(xyz, xyz_pred, return_trafo=True)
+        verts_pred_aligned = align_by_trafo(verts_pred, trafo)
+
+    xyz_aligned_data = (xyz, np.ones_like(xyz[:, 0]), xyz_pred_aligned)
+
+    # Mesh data
+    if shape_is_mano:
+        mesh_errors = np.ones_like(verts[:, 0])
+        mesh_data = (verts, mesh_errors, verts_pred)
+        mesh_aligned_data = (verts, mesh_errors, verts_pred_aligned)
+    else:
+        mesh_data = None
+        mesh_aligned_data = None
+
+    # F-scores
+    f_score_list = []
+    f_score_aligned_list = []
+    for t in f_threshs:
+        f, _, _ = calculate_fscore(verts, verts_pred, t)
+        f_score_list.append(f)
+        f, _, _ = calculate_fscore(verts, verts_pred_aligned, t)
+        f_score_aligned_list.append(f)
+
+    return {
+        'xyz_data': xyz_data,
+        'xyz_sc_tr_aligned_data': xyz_sc_tr_aligned_data,
+        'xyz_aligned_data': xyz_aligned_data,
+        'mesh_data': mesh_data,
+        'mesh_aligned_data': mesh_aligned_data,
+        'f_score': f_score_list,
+        'f_score_aligned': f_score_aligned_list,
+        'shape_is_mano': shape_is_mano,
+    }
+
+
 def main(gt_path, pred_path, output_dir, version, pred_file_name=None, set_name=None):
     if pred_file_name is None:
         pred_file_name = 'pred.json'
@@ -205,86 +266,42 @@ def main(gt_path, pred_path, output_dir, version, pred_file_name=None, set_name=
 
     shape_is_mano = None
 
-    try:
-        from tqdm import tqdm
-        rng = tqdm(range(db_size(set_name, version)))
-    except:
-        rng = range(db_size(set_name,version))
-
-    # iterate over the dataset once
-    for idx in rng:
-        if idx >= db_size(set_name,version):
-            break
-
-        xyz, verts = xyz_list[idx], verts_list[idx]
-        xyz, verts = [np.array(x) for x in [xyz, verts]]
-
-        xyz_pred, verts_pred = pred[0][idx], pred[1][idx]
-        xyz_pred, verts_pred = [np.array(x) for x in [xyz_pred, verts_pred]]
-
-        # Not aligned errors
-        eval_xyz.feed(
-            xyz,
-            np.ones_like(xyz[:, 0]),
-            xyz_pred
-        )
-
+    # Parallel processing
+    num_workers = 16  # Use a reasonable number of workers
+    print(f'Starting parallel evaluation with {num_workers} workers...')
+    
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        # Create partial function with fixed arguments
+        worker_fn = partial(_process_sample, xyz_list=xyz_list, verts_list=verts_list, pred=pred, f_threshs=f_threshs)
+        
+        # Process all samples in parallel
+        try:
+            from tqdm import tqdm as tqdm_import
+            results = list(tqdm_import(executor.map(worker_fn, range(db_size(set_name, version))), 
+                                      total=db_size(set_name, version)))
+        except:
+            results = executor.map(worker_fn, range(db_size(set_name, version)))
+    
+    # Aggregate results
+    f_score, f_score_aligned = list(), list()
+    for result in results:
+        # Feed xyz data
+        eval_xyz.feed(*result['xyz_data'])
+        eval_xyz_sc_tr_aligned.feed(*result['xyz_sc_tr_aligned_data'])
+        eval_xyz_procrustes_aligned.feed(*result['xyz_aligned_data'])
+        
+        # Determine if MANO
         if shape_is_mano is None:
-            if verts_pred.shape[0] == verts.shape[0]:
-                shape_is_mano = True
-            else:
-                shape_is_mano = False
-
-        if shape_is_mano:
-            eval_mesh_err.feed(
-                verts,
-                np.ones_like(verts[:, 0]),
-                verts_pred
-            )
-
-        # scale and translation aligned predictions for xyz
-        xyz_pred_sc_tr_aligned = align_sc_tr(xyz, xyz_pred)
-        eval_xyz_sc_tr_aligned.feed(
-            xyz,
-            np.ones_like(xyz[:, 0]),
-            xyz_pred_sc_tr_aligned
-        )
-
-        # align predictions
-        xyz_pred_aligned = align_w_scale(xyz, xyz_pred)
-        if shape_is_mano:
-            verts_pred_aligned = align_w_scale(verts, verts_pred)
-        else:
-            # use trafo estimated from keypoints
-            trafo = align_w_scale(xyz, xyz_pred, return_trafo=True)
-            verts_pred_aligned = align_by_trafo(verts_pred, trafo)
-
-        # Aligned errors
-        eval_xyz_procrustes_aligned.feed(
-            xyz,
-            np.ones_like(xyz[:, 0]),
-            xyz_pred_aligned
-        )
-
-        if shape_is_mano:
-            eval_mesh_err_aligned.feed(
-                verts,
-                np.ones_like(verts[:, 0]),
-                verts_pred_aligned
-            )
-
-        # F-scores
-        l, la = list(), list()
-        for t in f_threshs:
-            # for each threshold calculate the f score and the f score of the aligned vertices
-            f, _, _ = calculate_fscore(verts, verts_pred, t)
-            # f = 0.
-            l.append(f)
-            f, _, _ = calculate_fscore(verts, verts_pred_aligned, t)
-            # f = 0.
-            la.append(f)
-        f_score.append(l)
-        f_score_aligned.append(la)
+            shape_is_mano = result['shape_is_mano']
+        
+        # Feed mesh data
+        if shape_is_mano and result['mesh_data'] is not None:
+            eval_mesh_err.feed(*result['mesh_data'])
+            eval_mesh_err_aligned.feed(*result['mesh_aligned_data'])
+        
+        # Collect F-scores
+        f_score.append(result['f_score'])
+        f_score_aligned.append(result['f_score_aligned'])
 
     # Calculate results
     xyz_mean3d, _, xyz_auc3d, pck_xyz, thresh_xyz = eval_xyz.get_measures(0.0, 0.05, 100)
@@ -362,6 +379,8 @@ def main(gt_path, pred_path, output_dir, version, pred_file_name=None, set_name=
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Show some samples from the dataset.')
+    parser.add_argument('ground_truth_dir', type=str,
+                    help='Path to where the ground truth is.')
     parser.add_argument('input_dir', type=str,
                         help='Path to where prediction the submited result and the ground truth is.')
     parser.add_argument('output_dir', type=str,
@@ -371,10 +390,48 @@ if __name__ == '__main__':
     parser.add_argument('--version', type=str, choices=['v2', 'v3'],
                         help='HO3D version', default='v2')
     args = parser.parse_args()
+    """
+    # hamer results
+    python eval.py \
+    /data1/DATA/HO3D_v2/HO3D_V2_GT/ \
+    /data1/DATA/HaMeR_DATA/results/ \
+    /data1/DATA/HaMeR_DATA/results/ \
+    --version v2 \
+    --pred_file_name ho3d-val.json
+
+    # vggt results
+    python eval.py \
+    /data1/DATA/HO3D_v2/HO3D_V2_GT/ \
+    /data1/DATA/vggt-logs/logs-vggt-hoi/exp-10-21-ho3d/evaluation/ \
+    /data1/DATA/vggt-logs/logs-vggt-hoi/exp-10-21-ho3d/evaluation/ \
+    --version v2 \
+    --pred_file_name pred.json
+
+    python eval.py \
+    /data1/DATA/HO3D_v2/HO3D_V2_GT/ \
+    /data1/DATA/vggt-logs/logs-vggt-hoi/exp-10-22-ho3d-novalid/evaluation/ \
+    /data1/DATA/vggt-logs/logs-vggt-hoi/exp-10-22-ho3d-novalid/evaluation/ \
+    --version v2 \
+    --pred_file_name pred.json
+
+    python eval.py \
+    /data1/DATA/HO3D_v2/HO3D_V2_GT/ \
+    /data1/DATA/vggt-logs/logs-vggt-hoi/exp-10-27-ho3d-hamerdataset/evaluation/ \
+    /data1/DATA/vggt-logs/logs-vggt-hoi/exp-10-27-ho3d-hamerdataset/evaluation/ \
+    --version v2 \
+    --pred_file_name pred.json
+
+    python eval.py \
+    /data1/DATA/HO3D_v2/HO3D_V2_GT/ \
+    /data1/DATA/vggt-logs/logs-vggt-hoi/exp-1030-hamer-mixed-unfreeze-all/evaluation/ \
+    /data1/DATA/vggt-logs/logs-vggt-hoi/exp-1030-hamer-mixed-unfreeze-all/evaluation/ \
+    --version v2 \
+    --pred_file_name pred.json
+    """
     
     # call eval
     main(
-        os.path.join(args.input_dir),
+        os.path.join(args.ground_truth_dir),
         os.path.join(args.input_dir),
         args.output_dir,
         pred_file_name=args.pred_file_name,
